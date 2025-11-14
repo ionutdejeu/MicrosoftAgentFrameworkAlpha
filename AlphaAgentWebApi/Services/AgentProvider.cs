@@ -25,15 +25,18 @@ public class AgentProvider : IAgentProvider
     private readonly string _endpoint;
     private readonly DefaultAzureCredential _credential;
     private readonly IMongoDatabase _mongoDatabase;
+    private readonly AlphaAgentWebApi.Stores.Data.ChatHistoryDbContext? _chatHistoryDbContext;
     private readonly ILoggerFactory? _loggerFactory;
 
     public AgentProvider(
         IOptions<AgentConfiguration> agentConfig,
         IMongoDatabase mongoDatabase,
+        AlphaAgentWebApi.Stores.Data.ChatHistoryDbContext? chatHistoryDbContext = null,
         ILoggerFactory? loggerFactory = null)
     {
         _config = agentConfig.Value;
         _mongoDatabase = mongoDatabase;
+        _chatHistoryDbContext = chatHistoryDbContext;
         _loggerFactory = loggerFactory;
 
         // Initialize Azure OpenAI connection (previously in AgentFactory)
@@ -121,18 +124,22 @@ public class AgentProvider : IAgentProvider
         {
             Instructions = agentSettings.Instructions,
             Name = agentSettings.Name,
-            ChatMessageStoreFactory = ctx =>
-            {
-                // Create a new chat message store for this agent that stores the messages in a vector store.
-                var mongoVectorStore = new MongoVectorStore(_mongoDatabase);
-                var logger = _loggerFactory?.CreateLogger<VectorChatMessageStore>();
-                
-                return new VectorChatMessageStore(
-                    mongoVectorStore,
-                    ctx.SerializedState,
-                    ctx.JsonSerializerOptions,
-                    logger);
-            }
+                ChatMessageStoreFactory = ctx =>
+                {
+                    var logger = _loggerFactory?.CreateLogger<VectorChatMessageStore>();
+
+                    // If a ChatHistoryDbContext was provided via DI prefer the SQL-backed store
+                    if (_chatHistoryDbContext != null)
+                    {
+                        return new VectorChatMessageStore(
+                            _chatHistoryDbContext,
+                            ctx.SerializedState,
+                            ctx.JsonSerializerOptions,
+                            logger);
+                    }
+
+                    throw new InvalidOperationException("ChatHistoryDbContext was not provided. Register ChatHistoryDbContext in DI to enable MSSQL chat history storage.");
+                }
         };
 
         return _chatClient.CreateAIAgent(orchestratorOptions);

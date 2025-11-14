@@ -7,26 +7,27 @@ using System.Threading.Tasks;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.VectorData;
-using Microsoft.SemanticKernel.Connectors.MongoDB;
+using AlphaAgentWebApi.Stores.Data;
+using AlphaAgentWebApi.Stores.Entities;
+using Microsoft.EntityFrameworkCore;
 
 namespace AlphaAgentWebApi.Stores;
 internal sealed class VectorChatMessageStore : ChatMessageStore
 {
-    private readonly MongoVectorStore _mongoVectorStore;
+    private readonly ChatHistoryDbContext _dbContext;
     private readonly ILogger<VectorChatMessageStore>? _logger;
-    
+    private readonly JsonSerializerOptions? _jsonOptions;
+
     public VectorChatMessageStore(
-        MongoVectorStore mongoVectorStore,
+        ChatHistoryDbContext dbContext,
         JsonElement serializedStoreState,
         JsonSerializerOptions? jsonSerializerOptions = null,
         ILogger<VectorChatMessageStore>? logger = null)
     {
-        this._mongoVectorStore = mongoVectorStore ?? throw new ArgumentNullException(nameof(mongoVectorStore));
-        this._logger = logger;
-        
-        // Extract ThreadDbKey from serialized state
-        // When deserializing, ctx.SerializedState contains the value from "storeState" property (the threadId string)
+        _dbContext = dbContext ?? throw new ArgumentNullException(nameof(dbContext));
+        _logger = logger;
+        _jsonOptions = jsonSerializerOptions;
+
         if (serializedStoreState.ValueKind is JsonValueKind.String)
         {
             var threadIdString = serializedStoreState.GetString();
@@ -39,73 +40,146 @@ internal sealed class VectorChatMessageStore : ChatMessageStore
 
     public string? ThreadDbKey { get; internal set; }
 
-    public override async Task AddMessagesAsync(
-        IEnumerable<ChatMessage> messages,
-        CancellationToken cancellationToken)
+    public override async Task AddMessagesAsync(IEnumerable<ChatMessage> messages, CancellationToken cancellationToken)
     {
         this.ThreadDbKey ??= Guid.NewGuid().ToString("N");
-        
-        // Materialize the messages to ensure all are captured
+
         var messagesList = messages.ToList();
-        
-        var baseTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        
-        var collection = this._mongoVectorStore.GetCollection<string, ChatHistoryItem>("chat_history");
-        await collection.EnsureCollectionExistsAsync(cancellationToken);
-        
-        var chatHistoryItems = messagesList.Select((x, index) =>
+
+        // Ensure thread exists
+        var thread = await _dbContext.ChatThreads.FindAsync(new object[] { this.ThreadDbKey }, cancellationToken);
+        if (thread == null)
         {
-            // Generate unique key: if MessageId is null/empty.
-            var messageIdPart = !string.IsNullOrWhiteSpace(x.MessageId) 
-                ? x.MessageId 
-                : $"{baseTimestamp}_{index}";
-            var key = this.ThreadDbKey + messageIdPart;
-            
-            return new ChatHistoryItem()
+            thread = new ChatThread
             {
-                Key = key,
-                Timestamp = baseTimestamp + index,
                 ThreadId = this.ThreadDbKey,
-                SerializedMessage = JsonSerializer.Serialize(x),
-                MessageText = x.Text
+                CreatedAt = DateTimeOffset.UtcNow,
+                LastUpdatedAt = DateTimeOffset.UtcNow
             };
-        }).ToList();
-        
-        await collection.UpsertAsync(chatHistoryItems, cancellationToken);
+            await _dbContext.ChatThreads.AddAsync(thread, cancellationToken);
+        }
+
+        foreach (var msg in messagesList)
+        {
+            // Serialize original message for fidelity
+            var serialized = JsonSerializer.Serialize(msg, _jsonOptions);
+
+            var entity = new ChatMessageEntity
+            {
+                MessageId = string.IsNullOrWhiteSpace(msg.MessageId) ? null : msg.MessageId,
+                ThreadId = this.ThreadDbKey,
+                Role = msg.Role.ToString(),
+                SerializedMessage = serialized,
+                TextContent = msg.Text,
+                CreatedAt = DateTimeOffset.UtcNow
+            };
+
+            // Try to detect function_call or image in the serialized payload and populate specific columns
+            try
+            {
+                using var doc = JsonDocument.Parse(serialized);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("function_call", out var funcProp) || root.TryGetProperty("functionCall", out funcProp))
+                {
+                    entity.ContentType = "function_call";
+                    if (funcProp.ValueKind == JsonValueKind.Object)
+                    {
+                        if (funcProp.TryGetProperty("name", out var nameProp) && nameProp.ValueKind == JsonValueKind.String)
+                        {
+                            entity.FunctionCallName = nameProp.GetString();
+                        }
+
+                        if (funcProp.TryGetProperty("arguments", out var argsProp))
+                        {
+                            // store arguments as JSON string
+                            entity.FunctionCallArgumentsJson = argsProp.GetRawText();
+                        }
+                    }
+                }
+                else if (root.TryGetProperty("image", out var imageProp) || root.TryGetProperty("images", out imageProp))
+                {
+                    entity.ContentType = "image";
+                    // try to find a url inside
+                    if (imageProp.ValueKind == JsonValueKind.Object && imageProp.TryGetProperty("url", out var url))
+                    {
+                        entity.ImageUrl = url.GetString();
+                    }
+                }
+                else if (!string.IsNullOrWhiteSpace(msg.Text))
+                {
+                    entity.ContentType = "text";
+                }
+                else
+                {
+                    entity.ContentType = "other";
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogDebug(ex, "Failed to inspect serialized message for content-type detection");
+                entity.ContentType = "unknown";
+            }
+
+            await _dbContext.ChatMessages.AddAsync(entity, cancellationToken);
+        }
+
+        thread.LastUpdatedAt = DateTimeOffset.UtcNow;
+        await _dbContext.SaveChangesAsync(cancellationToken);
     }
 
-    public override async Task<IEnumerable<ChatMessage>> GetMessagesAsync(
-        CancellationToken cancellationToken)
+    public override async Task<IEnumerable<ChatMessage>> GetMessagesAsync(CancellationToken cancellationToken)
     {
-        // If ThreadDbKey is null, return empty (messages haven't been loaded yet or thread is new)
         if (string.IsNullOrWhiteSpace(this.ThreadDbKey))
         {
             return Array.Empty<ChatMessage>();
         }
 
-        var collection = this._mongoVectorStore.GetCollection<string, ChatHistoryItem>("chat_history");
-        await collection.EnsureCollectionExistsAsync(cancellationToken);
-        var records = collection
-            .GetAsync(
-                x => x.ThreadId == this.ThreadDbKey, 10,
-                new() { OrderBy = x => x.Descending(y => y.Timestamp) },
-                cancellationToken);
+        var records = _dbContext.ChatMessages
+            .Where(m => m.ThreadId == this.ThreadDbKey)
+            .OrderBy(m => m.Id);
 
-        List<ChatMessage> messages = [];
-        await foreach (var record in records)
+        var list = new List<ChatMessage>();
+        await foreach (var rec in records.AsAsyncEnumerable().WithCancellation(cancellationToken))
         {
-            messages.Add(JsonSerializer.Deserialize<ChatMessage>(record.SerializedMessage!)!);
+            if (!string.IsNullOrWhiteSpace(rec.SerializedMessage))
+            {
+                try
+                {
+                    var msg = JsonSerializer.Deserialize<ChatMessage>(rec.SerializedMessage, _jsonOptions);
+                    if (msg != null)
+                    {
+                        list.Add(msg);
+                        continue;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogDebug(ex, "Failed to deserialize stored ChatMessage, falling back to TextContent");
+                }
+            }
+
+            // Fallback: construct a basic ChatMessage using text if available
+            var fallbackJson = rec.SerializedMessage ?? JsonSerializer.Serialize(new { text = rec.TextContent });
+            try
+            {
+                var fallback = JsonSerializer.Deserialize<ChatMessage>(fallbackJson, _jsonOptions);
+                if (fallback != null)
+                {
+                    list.Add(fallback);
+                }
+            }
+            catch
+            {
+                // last fallback: ignore
+            }
         }
 
-        messages.Reverse();
-        return messages;
+        return list;
     }
 
     public override JsonElement Serialize(JsonSerializerOptions? jsonSerializerOptions = null)
     {
-        // We have to serialize the thread id, so that on deserialization you can retrieve the messages using the same thread id.
-        // Only create a new ThreadDbKey if it's null and we haven't added messages yet
-        // If ThreadDbKey was set during deserialization or AddMessagesAsync, preserve it
         if (string.IsNullOrWhiteSpace(this.ThreadDbKey))
         {
             this.ThreadDbKey = Guid.NewGuid().ToString("N");
