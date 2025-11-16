@@ -2,7 +2,7 @@ using System;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
 
-namespace AlphaAgentWebApi.Stores.Entities;
+namespace AlphaAgentWebApi.Entities;
 
 // This entity stores one chat message. It contains dedicated columns for the common OpenAI message
 // content types: text, image, function_call (name + arguments), tool responses and a RawJson fallback.

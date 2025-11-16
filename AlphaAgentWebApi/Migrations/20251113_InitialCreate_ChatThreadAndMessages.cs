@@ -3,7 +3,7 @@ using Microsoft.EntityFrameworkCore.Migrations;
 
 #nullable disable
 
-namespace AlphaAgentWebApi.Stores.Migrations
+namespace AlphaAgentWebApi.Migrations
 {
     public partial class InitialCreate_ChatThreadAndMessages : Migration
     {

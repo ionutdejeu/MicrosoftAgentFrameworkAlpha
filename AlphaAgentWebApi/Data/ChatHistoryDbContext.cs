@@ -1,8 +1,8 @@
 using System;
 using Microsoft.EntityFrameworkCore;
-using AlphaAgentWebApi.Stores.Entities;
+using AlphaAgentWebApi.Entities;
 
-namespace AlphaAgentWebApi.Stores.Data;
+namespace AlphaAgentWebApi.Data;
 
 public class ChatHistoryDbContext : DbContext
 {

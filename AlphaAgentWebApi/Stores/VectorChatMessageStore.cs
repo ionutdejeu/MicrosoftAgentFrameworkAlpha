@@ -7,9 +7,9 @@ using System.Threading.Tasks;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
-using AlphaAgentWebApi.Stores.Data;
-using AlphaAgentWebApi.Stores.Entities;
+using AlphaAgentWebApi.Entities;
 using Microsoft.EntityFrameworkCore;
+using AlphaAgentWebApi.Data;
 
 namespace AlphaAgentWebApi.Stores;
 internal sealed class VectorChatMessageStore : ChatMessageStore

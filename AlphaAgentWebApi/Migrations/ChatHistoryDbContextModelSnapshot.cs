@@ -1,11 +1,12 @@
 using System;
+using AlphaAgentWebApi.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
-namespace AlphaAgentWebApi.Stores.Migrations
+namespace AlphaAgentWebApi.Migrations
 {
-    [DbContext(typeof(AlphaAgentWebApi.Stores.Data.ChatHistoryDbContext))]
+    [DbContext(typeof(ChatHistoryDbContext))]
     partial class ChatHistoryDbContextModelSnapshot : ModelSnapshot
     {
         protected override void BuildModel(ModelBuilder modelBuilder)

@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace AlphaAgentWebApi.Stores.Entities;
+namespace AlphaAgentWebApi.Entities;
 
 public sealed class ChatThread
 {

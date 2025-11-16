@@ -11,6 +11,7 @@ using Microsoft.Extensions.Options;
 using Microsoft.SemanticKernel.Connectors.MongoDB;
 using MongoDB.Driver;
 using OpenAI;
+using AlphaAgentWebApi.Data;
 
 namespace AlphaAgentWebApi.Services;
 
@@ -24,18 +25,15 @@ public class AgentProvider : IAgentProvider
     private readonly string _deploymentName;
     private readonly string _endpoint;
     private readonly DefaultAzureCredential _credential;
-    private readonly IMongoDatabase _mongoDatabase;
-    private readonly AlphaAgentWebApi.Stores.Data.ChatHistoryDbContext? _chatHistoryDbContext;
+    private readonly ChatHistoryDbContext? _chatHistoryDbContext;
     private readonly ILoggerFactory? _loggerFactory;
 
     public AgentProvider(
         IOptions<AgentConfiguration> agentConfig,
-        IMongoDatabase mongoDatabase,
-        AlphaAgentWebApi.Stores.Data.ChatHistoryDbContext? chatHistoryDbContext = null,
+        ChatHistoryDbContext? chatHistoryDbContext = null,
         ILoggerFactory? loggerFactory = null)
     {
         _config = agentConfig.Value;
-        _mongoDatabase = mongoDatabase;
         _chatHistoryDbContext = chatHistoryDbContext;
         _loggerFactory = loggerFactory;
 
