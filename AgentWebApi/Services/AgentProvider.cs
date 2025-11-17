@@ -3,13 +3,13 @@ using AgentWebApi.Configuration;
 using AgentWebApi.Constants;
 using AgentWebApi.Models;
 using AgentWebApi.Stores;
-using Azure.AI.OpenAI;
-using Azure.Identity;
+using OpenAI;
 using Microsoft.Agents.AI;
+using System.Reflection;
+using System.Linq;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 // Removed SemanticKernel.MongoDB and MongoDB.Driver references: not used in this project
-using OpenAI;
 using AgentWebApi.Data;
 
 namespace AgentWebApi.Services;
@@ -19,11 +19,9 @@ public class AgentProvider : IAgentProvider
     private readonly AIAgent? _geographyAgent;
     private readonly AIAgent? _mathAgent;
     private readonly AIAgent? _orchestratorAgent;
-    private readonly OpenAI.Chat.ChatClient? _chatClient;
+    private readonly object? _chatClientObj;
     private readonly AgentConfiguration _config;
-    private readonly string? _deploymentName;
-    private readonly string? _endpoint;
-    private readonly DefaultAzureCredential? _credential;
+    private readonly string? _openAiKey;
     private readonly ChatHistoryDbContext? _chatHistoryDbContext;
     private readonly ILoggerFactory? _loggerFactory;
 
@@ -36,30 +34,75 @@ public class AgentProvider : IAgentProvider
         _chatHistoryDbContext = chatHistoryDbContext;
         _loggerFactory = loggerFactory;
 
-        // Initialize Azure OpenAI connection (previously in AgentFactory)
-        // Try to read deployment and endpoint from environment variables referenced by configuration
-        _deploymentName = Environment.GetEnvironmentVariable(_config.PsDeploymentEnvName);
-        _endpoint = Environment.GetEnvironmentVariable(_config.PsEndpointEnvName);
+        // Initialize OpenAI Chat client using API key from configuration (OpenAIKey)
+        _openAiKey = !string.IsNullOrWhiteSpace(_config.OpenAIKey)
+            ? _config.OpenAIKey
+            : Environment.GetEnvironmentVariable("OPENAI_API_KEY");
 
-        if (string.IsNullOrWhiteSpace(_deploymentName) || string.IsNullOrWhiteSpace(_endpoint))
+        if (string.IsNullOrWhiteSpace(_openAiKey))
         {
-            // Missing configuration for Azure OpenAI - do not initialize clients/agents.
+            // Missing OpenAI API key - do not initialize clients/agents.
             // This allows the application to start for development scenarios where secrets are not set.
-            _credential = null;
-            _chatClient = null;
+            _chatClientObj = null;
             _geographyAgent = null;
             _mathAgent = null;
             _orchestratorAgent = null;
             return;
         }
 
-        var authOptions = new DefaultAzureCredentialOptions { ExcludeAzureDeveloperCliCredential = false };
-        _credential = new DefaultAzureCredential(authOptions);
+        // Construct the OpenAI Chat client using reflection so this code
+        // is tolerant to multiple OpenAI SDK versions.
+        object? chatClientInstance = null;
+        var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+        var chatClientType = assemblies
+            .SelectMany(a =>
+            {
+                try { return a.GetTypes(); } catch { return Array.Empty<Type>(); }
+            })
+            .FirstOrDefault(t => t.FullName == "OpenAI.Chat.ChatClient");
 
-        _chatClient = new AzureOpenAIClient(new Uri(_endpoint), _credential)
-            .GetChatClient(_deploymentName);
+        if (chatClientType != null)
+        {
+            // Try static factory methods that accept a single string (API key)
+            var staticFactory = chatClientType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+                .FirstOrDefault(m => m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
 
-        // Create agents once during initialization (singleton pattern)
+            if (staticFactory != null)
+            {
+                chatClientInstance = staticFactory.Invoke(null, new object[] { _openAiKey! });
+            }
+            else
+            {
+                // Try a public constructor that accepts string
+                var ctorWithString = chatClientType.GetConstructor(new[] { typeof(string) });
+                if (ctorWithString != null)
+                {
+                    chatClientInstance = ctorWithString.Invoke(new object[] { _openAiKey! });
+                }
+                else
+                {
+                    // As a last resort try to create non-public instance
+                    try
+                    {
+                        chatClientInstance = Activator.CreateInstance(chatClientType, nonPublic: true);
+                        // If there is a writable ApiKey property, set it
+                        var apiKeyProp = chatClientType.GetProperty("ApiKey", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+                        if (apiKeyProp != null && apiKeyProp.CanWrite)
+                        {
+                            apiKeyProp.SetValue(chatClientInstance, _openAiKey);
+                        }
+                    }
+                    catch
+                    {
+                        chatClientInstance = null;
+                    }
+                }
+            }
+        }
+
+        _chatClientObj = chatClientInstance;
+
+        // Create agents once during initialization
         _geographyAgent = CreateGeographyAgent();
         _mathAgent = CreateMathAgent();
         _orchestratorAgent = CreateOrchestratorAgent();
@@ -109,7 +152,7 @@ public class AgentProvider : IAgentProvider
             }
         };
 
-        return _chatClient.CreateAIAgent(geographyOptions);
+        return CreateAgentUsingReflection(_chatClientObj, geographyOptions);
     }
 
     private AIAgent CreateMathAgent()
@@ -125,7 +168,7 @@ public class AgentProvider : IAgentProvider
             Name = agentSettings.Name
         };
 
-        return _chatClient.CreateAIAgent(mathOptions);
+        return CreateAgentUsingReflection(_chatClientObj, mathOptions);
     }
 
     private AIAgent CreateOrchestratorAgent()
@@ -157,42 +200,94 @@ public class AgentProvider : IAgentProvider
                 }
         };
 
-        return _chatClient.CreateAIAgent(orchestratorOptions);
+        return CreateAgentUsingReflection(_chatClientObj, orchestratorOptions);
     }
 
     public AIAgent CreateAgent(ChatClientAgentOptions options)
     {
-        if (_chatClient == null)
+        if (_chatClientObj == null)
         {
-            throw new InvalidOperationException("Azure OpenAI Chat client is not initialized. Set deployment and endpoint environment variables to enable agent creation.");
+            throw new InvalidOperationException("OpenAI Chat client is not initialized. Set `AgentConfiguration:OpenAIKey` or the `OPENAI_API_KEY` environment variable to enable agent creation.");
         }
-        return _chatClient.CreateAIAgent(options);
+
+        return CreateAgentUsingReflection(_chatClientObj, options);
     }
 
     public AIAgent CreateAgent(ChatClientAgentOptions options, string? deploymentName, string? endpoint)
     {
-        bool hasDeployment = !string.IsNullOrWhiteSpace(deploymentName);
-        bool hasEndpoint = !string.IsNullOrWhiteSpace(endpoint);
-
-        if (hasDeployment ^ hasEndpoint)
+        // For the OpenAI (non-Azure) path, ignore deploymentName/endpoint override
+        // and create the agent using the configured API key. If you need to target
+        // a different OpenAI base URL or model, update `AgentConfiguration` and
+        // supply a different `OpenAIKey` or extend this method accordingly.
+        if (_chatClientObj == null)
         {
-            throw new ArgumentException("Both deploymentName and endpoint must be provided together when overriding.");
+            throw new InvalidOperationException("OpenAI Chat client is not initialized. Set `AgentConfiguration:OpenAIKey` or the `OPENAI_API_KEY` environment variable to enable agent creation.");
         }
 
-        string effectiveDeployment = hasDeployment ? deploymentName! : _deploymentName;
-        string effectiveEndpoint = hasEndpoint ? endpoint! : _endpoint;
+        return CreateAgentUsingReflection(_chatClientObj, options);
+    }
 
-        ArgumentException.ThrowIfNullOrWhiteSpace(effectiveDeployment);
-        ArgumentException.ThrowIfNullOrWhiteSpace(effectiveEndpoint);
+    private AIAgent CreateAgentUsingReflection(object? chatClientObj, ChatClientAgentOptions options)
+    {
+        if (chatClientObj == null)
+            throw new InvalidOperationException("Chat client instance is null.");
 
-        if (_credential == null)
+        // Find the extension type that defines CreateAIAgent
+        var extType = AppDomain.CurrentDomain.GetAssemblies()
+            .SelectMany(a =>
+            {
+                try { return a.GetTypes(); } catch { return Array.Empty<Type>(); }
+            })
+            .FirstOrDefault(t => t.Name == "OpenAIChatClientExtensions" || t.FullName == "Microsoft.Agents.AI.OpenAI.OpenAIChatClientExtensions");
+
+        if (extType == null)
+            throw new InvalidOperationException("Could not locate OpenAIChatClientExtensions in loaded assemblies.");
+
+        // Find a suitable CreateAIAgent overload
+        var methods = extType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Where(m => m.Name == "CreateAIAgent").ToArray();
+
+        MethodInfo? createMethod = null;
+        foreach (var m in methods)
         {
-            throw new InvalidOperationException("Azure credentials are not available for creating an agent. Set environment configuration.");
+            var ps = m.GetParameters();
+            if (ps.Length >= 2 && ps[0].ParameterType.FullName == chatClientObj.GetType().FullName && ps[1].ParameterType == typeof(ChatClientAgentOptions))
+            {
+                createMethod = m;
+                break;
+            }
         }
 
-        return new AzureOpenAIClient(new Uri(effectiveEndpoint), _credential)
-            .GetChatClient(effectiveDeployment)
-            .CreateAIAgent(options);
+        // If not found by exact match, pick first overload with first parameter assignable from the chat client type
+        if (createMethod == null)
+        {
+            foreach (var m in methods)
+            {
+                var ps = m.GetParameters();
+                if (ps.Length >= 2 && ps[1].ParameterType == typeof(ChatClientAgentOptions) && ps[0].ParameterType.IsAssignableFrom(chatClientObj.GetType()))
+                {
+                    createMethod = m;
+                    break;
+                }
+            }
+        }
+
+        if (createMethod == null)
+            throw new InvalidOperationException("Suitable CreateAIAgent method not found on OpenAIChatClientExtensions.");
+
+        // Prepare arguments: (chatClient, options, clientFactory?, loggerFactory?, services?)
+        var psCount = createMethod.GetParameters().Length;
+        var args = new List<object?> { chatClientObj, options };
+        // Add optional parameters as null or logger factory
+        if (psCount >= 3) args.Add(null);
+        if (psCount >= 4) args.Add(_loggerFactory);
+        if (psCount >= 5) args.Add(null);
+
+        var result = createMethod.Invoke(null, args.ToArray());
+        if (result is AIAgent agent)
+            return agent;
+
+        throw new InvalidOperationException("CreateAIAgent did not return an AIAgent instance.");
     }
 }
 

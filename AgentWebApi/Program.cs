@@ -1,3 +1,5 @@
+using Microsoft.EntityFrameworkCore;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
@@ -7,11 +9,15 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 // Register controllers so controller routes are discovered
 builder.Services.AddControllers();
+// Register DbContext for ChatHistory using SQL Server
+builder.Services.AddDbContext<AgentWebApi.Data.ChatHistoryDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("ChatHistorySql")));
 // Bind AgentConfiguration from appsettings
 builder.Services.Configure<AgentWebApi.Configuration.AgentConfiguration>(builder.Configuration.GetSection("AgentConfiguration"));
 
 // Register core services and implementations
-builder.Services.AddSingleton<AgentWebApi.Interfaces.IAgentProvider, AgentWebApi.Services.AgentProvider>();
+// AgentProvider depends on scoped DbContext for chat history; register as scoped
+builder.Services.AddScoped<AgentWebApi.Interfaces.IAgentProvider, AgentWebApi.Services.AgentProvider>();
 builder.Services.AddScoped<AgentWebApi.Interfaces.IGeographyAgentService, AgentWebApi.Services.GeographyAgentService>();
 builder.Services.AddScoped<AgentWebApi.Interfaces.IMathAgentService, AgentWebApi.Services.MathAgentService>();
 builder.Services.AddScoped<AgentWebApi.Interfaces.IOrchestratorAgentService, AgentWebApi.Services.OrchestratorAgentService>();
