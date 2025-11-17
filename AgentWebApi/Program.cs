@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using System.Linq;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -14,6 +15,28 @@ builder.Services.AddDbContext<AgentWebApi.Data.ChatHistoryDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("ChatHistorySql")));
 // Bind AgentConfiguration from appsettings
 builder.Services.Configure<AgentWebApi.Configuration.AgentConfiguration>(builder.Configuration.GetSection("AgentConfiguration"));
+
+// Configure CORS using the `AllowedHosts` value from configuration.
+var allowedHostsConfig = builder.Configuration["AllowedHosts"] ?? "*";
+const string corsPolicyName = "AllowedHostsPolicy";
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(corsPolicyName, policyBuilder =>
+    {
+        if (allowedHostsConfig.Trim() == "*")
+        {
+            policyBuilder.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod();
+        }
+        else
+        {
+            var origins = allowedHostsConfig
+                .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim())
+                .ToArray();
+            policyBuilder.WithOrigins(origins).AllowAnyHeader().AllowAnyMethod();
+        }
+    });
+});
 
 // Register core services and implementations
 // AgentProvider depends on scoped DbContext for chat history; register as scoped
@@ -33,6 +56,9 @@ app.UseSwagger();
 app.UseSwaggerUI();
 
 app.UseHttpsRedirection();
+
+// Apply CORS policy configured from `AllowedHosts` before authorization
+app.UseCors("AllowedHostsPolicy");
 
 app.UseAuthorization();
 
